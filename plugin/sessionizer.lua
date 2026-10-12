@@ -1,20 +1,24 @@
 -- sessionizer: pick a project, go to its workspace, or make one there.
 --
+-- Needs ranma 0.2.2 or newer, the first with workspace names and
+-- ranma.layouts() in Lua.
+--
 -- ThePrimeagen's tmux-sessionizer for ranma. leader F (shift+f; or
 -- `sessionizer` in the palette) lists the directories under the roots
 -- (sessionizer.roots, sessionizer.depth levels down, hidden ones skipped)
 -- and the extra directories (sessionizer.extra), found with `find`, the
 -- listing reused for sessionizer.cache seconds. Picking one:
---   open      go there: a pane in it is focused (the one sessionizer
---             opened, else one whose shell is in the directory), or with
---             sessionizer.target = "session" the session named after it
---   not open  an empty workspace, a shell in the directory, the workspace
---             named after it; with target "session", moved to a new
---             session of that name. A layout named after the project
---             (ranma's `load_layout`) is loaded instead of the shell:
---             sessionizer.layout = "saved" when `save_layout` wrote one,
---             "always" to try it every time (layouts init.lua declares),
---             "off" never.
+--   open      go there: the workspace named after it (this session's
+--             first, else a pane of one in another session), else a pane
+--             whose shell is in the directory; with sessionizer.target =
+--             "session", the session named after it
+--   not open  an empty, unnamed workspace, a shell in the directory,
+--             the workspace named after it; with target "session",
+--             moved to a new session of that name. With
+--             sessionizer.layout on (the default), a layout named after
+--             the project, declared in init.lua or saved with
+--             `save_layout`, is loaded instead of the shell when there
+--             is one.
 -- Open projects are marked ● in the picker and listed first.
 -- `sessionizer NAME` in the palette goes to that project without a picker.
 -- Another key: ranma.unbind("shift+f"), then
@@ -50,9 +54,9 @@ ranma.option("sessionizer.target", {
   desc = "What a project gets: a workspace named after it in this session, or a session of its own.",
 })
 ranma.option("sessionizer.layout", {
-  type = "enum", choices = { "saved", "always", "off" }, default = "saved",
+  type = "bool", default = true,
   name = "Layout",
-  desc = "Load the layout named after a new project's workspace: when save_layout wrote one, always (for init.lua's), or never.",
+  desc = "A new project's workspace loads the layout named after it, declared in init.lua or saved with save_layout, when there is one.",
 })
 ranma.option("sessionizer.cache", {
   type = "int", min = 0, max = 600, step = 10, default = 30, slider = false,
@@ -60,18 +64,12 @@ ranma.option("sessionizer.cache", {
   desc = "Seconds a listing of the roots is reused before find runs again; 0 lists every time.",
 })
 
--- Prints `home`, the saved layouts and the projects, one tab-separated record
--- a line. Arguments: depth, the roots, `--`, the extra directories.
+-- Prints `home` and the projects, one tab-separated record a line.
+-- Arguments: depth, the roots, `--`, the extra directories.
 local LIST = [=[
 tab=$(printf '\t')
 depth=$1; shift
 printf 'home%s%s\n' "$tab" "$HOME"
-d=${XDG_STATE_HOME:-$HOME/.local/state}/ranma/layouts
-for f in "$d"/*.toml; do
-  [ -f "$f" ] || continue
-  b=${f##*/}
-  printf 'layout%s%s\n' "$tab" "${b%.toml}"
-done
 kind=root
 for r in "$@"; do
   [ "$r" = "--" ] && { kind=extra; continue; }
@@ -107,20 +105,18 @@ local function quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
--- The listing in use: { projects = { {name, path, short} }, layouts = set },
--- or nil once it is older than sessionizer.cache. `generation` lets a timer
--- set for an old listing leave a newer one alone.
+-- The listing in use: { projects = { {name, path, short} } }, or nil once it
+-- is older than sessionizer.cache. `generation` lets a timer set for an old
+-- listing leave a newer one alone.
 local listing, generation, listing_job = nil, 0, nil
 local waiting = {}   -- what to do with the listing a running `find` brings
 
 local function parse(stdout)
-  local home, projects, layouts, seen = nil, {}, {}, {}
+  local home, projects, seen = nil, {}, {}
   for line in stdout:gmatch("[^\n]+") do
     local kind, value = line:match("^(%a+)\t(.*)$")
     if kind == "home" then
       home = value
-    elseif kind == "layout" then
-      layouts[value] = true
     elseif kind == "dir" then
       local path = value:gsub("/+$", "")
       if path ~= "" and not seen[path] then
@@ -134,7 +130,7 @@ local function parse(stdout)
     end
   end
   table.sort(projects, function(a, b) return a.short < b.short end)
-  return { projects = projects, layouts = layouts }
+  return { projects = projects }
 end
 
 -- Call fn with the listing, running `find` if there is none in use.
@@ -168,45 +164,51 @@ local function with_listing(fn)
   })
 end
 
--- Panes sessionizer opened are marked with their project's path for as long
--- as `vars` lasts (a reload clears it; the directory test still finds them).
-local opening = nil
-
-ranma.on("pane_open", function(ev)
-  if not opening then return end
-  local p = ranma.pane(ev.pane)
-  if p then p.vars.sessionizer = opening end
-end)
-
--- Every pane in a project, by its path: marked ones, else those whose
--- directory is in it (the deepest project wins, for depth > 1).
-local function panes_by_project(projects)
-  local paths, by = {}, {}
+-- Where each open project is, by its path: { workspace = N } for a workspace
+-- of the shown session named after it (empty or not), else { panes = ... }:
+-- those of a workspace named after it in another session, else those whose
+-- shell is in its directory (the deepest project wins, for depth > 1).
+local function places(projects)
+  local st = ranma.state()
+  local here = {}   -- name -> the lowest workspace of the shown session with it
+  for n, name in pairs(st.names or {}) do
+    if not here[name] or n < here[name] then here[name] = n end
+  end
+  local paths, elsewhere, inside = {}, {}, {}
   for _, pr in ipairs(projects) do paths[pr.path] = true end
   for _, p in ipairs(ranma.panes()) do
-    local path = p.vars.sessionizer
-    if not (path and paths[path]) then
-      path = nil
-      local ok, cwd = pcall(p.cwd, p)
-      local dir = ok and cwd and cwd:gsub("/+$", "") or nil
-      while dir and dir ~= "" do
-        if paths[dir] then path = dir; break end
-        dir = dir:match("^(.*)/[^/]*$")
-      end
+    local wn = p.workspace_name
+    if wn and p.session ~= st.session then
+      elsewhere[wn] = elsewhere[wn] or {}
+      table.insert(elsewhere[wn], p)
     end
-    if path then
-      by[path] = by[path] or {}
-      table.insert(by[path], p)
+    local ok, cwd = pcall(p.cwd, p)
+    local dir = ok and cwd and cwd:gsub("/+$", "") or nil
+    while dir and dir ~= "" do
+      if paths[dir] then
+        inside[dir] = inside[dir] or {}
+        table.insert(inside[dir], p)
+        break
+      end
+      dir = dir:match("^(.*)/[^/]*$")
+    end
+  end
+  local by = {}
+  for _, pr in ipairs(projects) do
+    if here[pr.name] then
+      by[pr.path] = { workspace = here[pr.name] }
+    elseif elsewhere[pr.name] or inside[pr.path] then
+      by[pr.path] = { panes = elsewhere[pr.name] or inside[pr.path] }
     end
   end
   return by
 end
 
--- The pane to go to: one sessionizer opened, then one in the shown session,
--- then the focused one of its workspace.
+-- The pane to go to: one in the shown session, then the focused one of its
+-- workspace.
 local function best(panes, session)
   local function score(p)
-    return (p.vars.sessionizer and 4 or 0) + (p.session == session and 2 or 0) + (p.focused and 1 or 0)
+    return (p.session == session and 2 or 0) + (p.focused and 1 or 0)
   end
   table.sort(panes, function(a, b)
     local sa, sb = score(a), score(b)
@@ -223,71 +225,77 @@ local function has_session(name)
   return false
 end
 
+local function has_layout(name)
+  for _, l in ipairs(ranma.layouts()) do
+    if l.name == name then return true end
+  end
+  return false
+end
+
 local function shell_in(path)
   local ok, shell = pcall(ranma.get, "shell")
   if not (ok and type(shell) == "string" and shell ~= "") then shell = nil end
   ranma.action("exec cd -- " .. quote(path) .. " && exec " .. (shell and quote(shell) or '"${SHELL:-/bin/sh}"'))
 end
 
-local function to_session(pr)
+-- The first workspace with no panes and no name. `workspace empty` would take
+-- an empty named one, and the rename would take that name from its project.
+local function free_workspace()
+  local st = ranma.state()
+  local taken = {}
+  for _, n in ipairs(st.workspaces or {}) do taken[n] = true end
+  for n in pairs(st.names or {}) do taken[n] = true end
+  for _, n in ipairs(st.hidden or {}) do taken[n] = true end
+  for n = 1, 99 do
+    if not taken[n] then return tostring(n) end
+  end
+  return "empty"
+end
+
+local function create(pr)
+  ranma.action("workspace " .. free_workspace())
+  if ranma.get("sessionizer.layout") and has_layout(pr.name) then
+    ranma.action("load_layout " .. pr.name)
+  else
+    shell_in(pr.path)
+  end
+  ranma.action("rename_workspace " .. pr.name)
   if ranma.get("sessionizer.target") == "session" then
     ranma.action("move_workspace_to_session " .. pr.name)
   end
 end
 
-local function create(pr, layouts)
-  local mode = ranma.get("sessionizer.layout")
-  opening = pr.path
-  ranma.defer(1000, function() opening = nil end)
-  ranma.action("workspace empty")
-  if not (mode == "always" or (mode == "saved" and layouts[pr.name])) then
-    shell_in(pr.path)
-    ranma.action("rename_workspace " .. pr.name)
-    return to_session(pr)
-  end
-  ranma.action("load_layout " .. pr.name)
-  ranma.action("rename_workspace " .. pr.name)
-  -- A name no layout has opens nothing (ranma says so in the bar), and an
-  -- empty workspace cannot move to a session: a shell there, then.
-  local ws = nil
-  ranma.defer(0, function() ws = ranma.state().workspace end)
-  ranma.defer(150, function()
-    local st = ranma.state()
-    if st.workspace ~= ws then return end
-    local occupied = false
-    for _, n in ipairs(st.workspaces or {}) do
-      if n == ws then occupied = true end
-    end
-    if not occupied then shell_in(pr.path) end
-    to_session(pr)
-  end)
-end
-
-local function go(pr, l, by)
+local function go(pr, by)
   if ranma.get("sessionizer.target") == "session" then
     if has_session(pr.name) then return ranma.action("session " .. pr.name) end
-    return create(pr, l.layouts)
+    return create(pr)
   end
-  local panes = by and by[pr.path]
-  if panes and #panes > 0 then
-    return best(panes, ranma.state().session):focus()
+  local place = by[pr.path]
+  if place and place.workspace then
+    return ranma.action("workspace " .. place.workspace)
+  elseif place then
+    return best(place.panes, ranma.state().session):focus()
   end
-  create(pr, l.layouts)
+  create(pr)
 end
 
 local function pick(l)
   if #l.projects == 0 then
     return ranma.notify("sessionizer: no projects under " .. ranma.get("sessionizer.roots"))
   end
-  local by = panes_by_project(l.projects)
+  local by = places(l.projects)
+  local session = ranma.state().session
   local sessions = ranma.get("sessionizer.target") == "session"
   local open, closed = {}, {}
   for _, pr in ipairs(l.projects) do
     local where
+    local place = by[pr.path]
     if sessions then
       where = has_session(pr.name) and "session"
-    elseif by[pr.path] then
-      local p = best(by[pr.path], ranma.state().session)
+    elseif place and place.workspace then
+      where = session .. ":" .. place.workspace
+    elseif place then
+      local p = best(place.panes, session)
       where = p.session .. ":" .. p.workspace
     end
     local item = { label = pr.name, detail = pr.short, project = pr }
@@ -304,7 +312,7 @@ local function pick(l)
     title = "projects",
     items = open,
     on_select = function(item)
-      if item and item.project then go(item.project, l, panes_by_project(l.projects)) end
+      if item and item.project then go(item.project, places(l.projects)) end
     end,
   }
 end
@@ -313,7 +321,7 @@ local function open(name)
   with_listing(function(l)
     if not name or name == "" then return pick(l) end
     for _, pr in ipairs(l.projects) do
-      if pr.name == name then return go(pr, l, panes_by_project(l.projects)) end
+      if pr.name == name then return go(pr, places(l.projects)) end
     end
     ranma.notify("sessionizer: no project called " .. name)
   end)

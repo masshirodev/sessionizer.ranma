@@ -7,10 +7,12 @@ API is https://github.com/masshirodev/ranma/blob/main/doc/CONFIG.md (`ranma --du
 - Push to `main`.
 - A change to what it does changes the header comment and `README.md` in the
   same commit, and an option goes in the README's table.
-- It loads into the latest ranma release, so it uses only the API that release
-  has. Its Lua cannot read workspace names, and a `ranma.spawn` job has no
-  `RANMA_SOCKET` to reach `ranma open` with: that is why open projects are
-  found by pane directory and new workspaces are built from actions.
+- It needs ranma 0.2.2 or newer, and uses only the API the latest release
+  has (the README says which version). Open projects are found by workspace
+  name (`ranma.state().names`, a pane's `workspace_name`), then by pane
+  directory; layouts by `ranma.layouts()`. New workspaces are built from
+  actions rather than a `ranma open` job: actions run at once, need no
+  `ranma` on the job's PATH, and the layout path needs them anyway.
 - Check it loads: `ranma --check-config` lists every plugin and why one failed;
   `ranma lua` runs code in the live server.
   CI (`.github/workflows/ci.yml`) loads it into the latest ranma release on
