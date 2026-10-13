@@ -15,10 +15,12 @@
 --   not open  an empty, unnamed workspace, a shell in the directory,
 --             the workspace named after it; with target "session",
 --             moved to a new session of that name. With
---             sessionizer.layout on (the default), a layout named after
---             the project, declared in init.lua or saved with
---             `save_layout`, is loaded instead of the shell when there
---             is one.
+--             sessionizer.layout on (the default), the project's own
+--             layout file (.ranma/layout.lua, read by project.ranma when
+--             it is installed, which asks before running one), else a
+--             layout named after the project, declared in init.lua or
+--             saved with `save_layout`, is loaded instead of the shell
+--             when there is one.
 -- Open projects are marked ● in the picker and listed first.
 -- `sessionizer NAME` in the palette goes to that project without a picker.
 -- Another key: ranma.unbind("shift+f"), then
@@ -56,7 +58,7 @@ ranma.option("sessionizer.target", {
 ranma.option("sessionizer.layout", {
   type = "bool", default = true,
   name = "Layout",
-  desc = "A new project's workspace loads the layout named after it, declared in init.lua or saved with save_layout, when there is one.",
+  desc = "A new project's workspace loads its .ranma/layout.lua (through project.ranma, when installed), else the layout named after it, declared in init.lua or saved with save_layout, when there is one.",
 })
 ranma.option("sessionizer.cache", {
   type = "int", min = 0, max = 600, step = 10, default = 30, slider = false,
@@ -252,10 +254,10 @@ local function free_workspace()
   return "empty"
 end
 
-local function create(pr)
+local function make(pr, layout)
   ranma.action("workspace " .. free_workspace())
-  if ranma.get("sessionizer.layout") and has_layout(pr.name) then
-    ranma.action("load_layout " .. pr.name)
+  if layout then
+    ranma.action("load_layout " .. layout)
   else
     shell_in(pr.path)
   end
@@ -263,6 +265,17 @@ local function create(pr)
   if ranma.get("sessionizer.target") == "session" then
     ranma.action("move_workspace_to_session " .. pr.name)
   end
+end
+
+-- The layout, in order: the repository's own file through project.ranma
+-- (which asks before it runs one), then one named after the project.
+local function create(pr)
+  local named = ranma.get("sessionizer.layout") and has_layout(pr.name) and pr.name or nil
+  local ok, project = pcall(require, "project")
+  if ranma.get("sessionizer.layout") and ok and type(project) == "table" and project.layout_for then
+    return project.layout_for(pr.path, function(layout) make(pr, layout or named) end)
+  end
+  make(pr, named)
 end
 
 local function go(pr, by)
